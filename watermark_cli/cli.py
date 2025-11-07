@@ -7,9 +7,9 @@ from typing import Optional
 import click
 import numpy as np
 from PIL import Image
+import cv2
 
 from watermark_cli.embedding.lsb2 import embed_bits_lsb2, extract_bits_lsb2, select_positions
-from watermark_cli.ecc.rs import ecc_encode_bits, ecc_decode_bits
 from watermark_cli.utils.image_io import load_image_as_numpy, save_numpy_as_image
 from watermark_cli.utils.metrics import compute_psnr, compute_ssim
 from watermark_cli.importance import ImportanceMap
@@ -69,6 +69,11 @@ def embed(input_path: str, output_path: str, message: Optional[str], message_b64
 		raise click.UsageError("Provide --message or --message-b64")
 
 	payload_bits = _b64_to_bits(message_b64) if message_b64 else _text_to_bits(message or "")
+	# Import ECC codec lazily so commands that don't need it (like diff/quality) don't require reedsolo
+	try:
+		from watermark_cli.ecc.rs import ecc_encode_bits
+	except Exception as e:
+		raise click.ClickException("Missing dependency for ECC encoding. Install requirements.txt (pip install -r requirements.txt) or install 'reedsolo'. Error: %s" % e)
 	coded_bits = ecc_encode_bits(payload_bits, rs_parity_symbols=ecc_symbols)
 	img = load_image_as_numpy(input_path)
 
@@ -116,6 +121,11 @@ def extract(input_path: str, key: str, length_bits: int, channels: str, ecc_symb
 
 	positions = select_positions(img.shape, coded_bits_len, key=key, channels=channels, importance=importance)
 	recovered_bits = extract_bits_lsb2(img, positions)[:coded_bits_len]
+	# Import ECC decode lazily
+	try:
+		from watermark_cli.ecc.rs import ecc_decode_bits
+	except Exception as e:
+		raise click.ClickException("Missing dependency for ECC decoding. Install requirements.txt (pip install -r requirements.txt) or install 'reedsolo'. Error: %s" % e)
 	decoded_bits = ecc_decode_bits(recovered_bits, expected_payload_bits=length_bits, rs_parity_symbols=ecc_symbols)
 
 	if decoded_bits is None:
@@ -147,6 +157,79 @@ def quality(ref_path: str, test_path: str, as_json: bool):
 		click.echo(json.dumps({"psnr": float(psnr), "ssim": float(ssim)}))
 	else:
 		click.echo(f"PSNR: {psnr:.2f} dB, SSIM: {ssim:.4f}")
+
+
+def _save_diff_images(ref: np.ndarray, test: np.ndarray, out_dir: str, base_name: str) -> dict:
+	"""Create and save visualizations comparing ref and test images.
+
+	Saves three images in out_dir with base_name prefix:
+	- <base_name>_absdiff.png : per-channel absolute difference image
+	- <base_name>_heatmap.png : colored heatmap of difference overlaid on test image
+	- <base_name>_sidebyside.png : reference | test | heatmap overlay
+
+	Returns dict with saved paths.
+	"""
+	out_dir = out_dir or "."
+	os.makedirs(out_dir, exist_ok=True)
+	paths = {}
+	# Absolute per-channel difference (clipped to 0-255)
+	absdiff = np.abs(ref.astype(np.int16) - test.astype(np.int16)).astype(np.uint8)
+	abs_path = os.path.join(out_dir, f"{base_name}_absdiff.png")
+	Image.fromarray(absdiff).save(abs_path)
+	paths["absdiff"] = abs_path
+
+	# Per-pixel magnitude (L2) for heatmap
+	mag = np.linalg.norm((ref.astype(np.float32) - test.astype(np.float32)), axis=2)
+	if mag.max() <= 0.0:
+		norm = np.zeros_like(mag, dtype=np.uint8)
+	else:
+		norm = (255.0 * (mag / float(mag.max()))).clip(0, 255).astype(np.uint8)
+
+	# Apply OpenCV colormap (expects single-channel 8-bit), returns BGR
+	heat_bgr = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
+	# Convert heatmap to RGB to match our arrays
+	heat_rgb = cv2.cvtColor(heat_bgr, cv2.COLOR_BGR2RGB)
+
+	# Overlay heatmap onto test image (alpha blend)
+	alpha = 0.5
+	overlay = (test.astype(np.float32) * (1.0 - alpha) + heat_rgb.astype(np.float32) * alpha).clip(0, 255).astype(np.uint8)
+	heat_path = os.path.join(out_dir, f"{base_name}_heatmap.png")
+	Image.fromarray(overlay).save(heat_path)
+	paths["heatmap_overlay"] = heat_path
+
+	# Side-by-side: ref | test | overlay
+	sb = np.concatenate([ref, test, overlay], axis=1)
+	sb_path = os.path.join(out_dir, f"{base_name}_sidebyside.png")
+	Image.fromarray(sb).save(sb_path)
+	paths["side_by_side"] = sb_path
+
+	return paths
+
+
+@cli.command()
+@click.option("--ref", "ref_path", required=True, type=click.Path(exists=True, dir_okay=False))
+@click.option("--test", "test_path", required=True, type=click.Path(exists=True, dir_okay=False))
+@click.option("--out-dir", "out_dir", required=False, type=click.Path(file_okay=False), default='.')
+@click.option("--base-name", "base_name", required=False, type=str, default='diff')
+@click.option("--json", "as_json", is_flag=True, default=False, help="Output JSON")
+def diff(ref_path: str, test_path: str, out_dir: str, base_name: str, as_json: bool):
+	"""Compute metrics and create visual diffs between reference and test images.
+
+	Saves visualizations to --out-dir and prints PSNR/SSIM. Use --json for machine-readable output.
+	"""
+	ref = load_image_as_numpy(ref_path)
+	test = load_image_as_numpy(test_path)
+	psnr = compute_psnr(ref, test)
+	ssim = compute_ssim(ref, test)
+	paths = _save_diff_images(ref, test, out_dir, base_name)
+	result = {"psnr": float(psnr), "ssim": float(ssim), "paths": paths}
+	if as_json:
+		click.echo(json.dumps(result))
+	else:
+		click.echo(f"PSNR: {psnr:.2f} dB, SSIM: {ssim:.4f}")
+		click.echo("Saved:")
+		for k, p in paths.items():
+			click.echo(f" - {k}: {p}")
 
 
 if __name__ == "__main__":
