@@ -1,0 +1,6 @@
+results_no_model
+results_with_model
+train
+diff_absdiff.png
+diff_heatmap.png
+diff_sidebyside.png
